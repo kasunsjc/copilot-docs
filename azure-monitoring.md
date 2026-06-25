@@ -170,22 +170,19 @@ Add the following dependencies to your `pom.xml`:
 </dependency>
 ```
 
-### 2. Configure `application.yaml`
+### 2. Configure Prometheus via Environment Variables
+
+Set the following environment variables on your Camunda deployment (e.g. in your Kubernetes `Deployment` or `StatefulSet`):
 
 ```yaml
-management:
-  endpoints:
-    web:
-      exposure:
-        include: health, info, prometheus, metrics
-  endpoint:
-    prometheus:
-      enabled: true
-  metrics:
-    export:
-      prometheus:
-        enabled: true
+env:
+  - name: MANAGEMENT_ENDPOINT_PROMETHEUS_ACCESS
+    value: "unrestricted"
+  - name: MANAGEMENT_PROMETHEUS_METRICS_EXPORT_ENABLED
+    value: "true"
 ```
+
+> These correspond to the Spring Boot properties `management.endpoint.prometheus.access` and `management.prometheus.metrics.export.enabled` as documented in the [Camunda Self-Managed Metrics guide](https://docs.camunda.io/docs/self-managed/operational-guides/monitoring/metrics/).
 
 ### 3. Key Camunda Metrics Available
 
