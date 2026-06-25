@@ -14,11 +14,12 @@ This document describes the observability setup for our Kubernetes-based environ
 4. [Azure Managed Grafana Setup](#azure-managed-grafana-setup)
 5. [Camunda Metrics Integration](#camunda-metrics-integration)
 6. [PodMonitor Configuration](#podmonitor-configuration)
-7. [Linking Grafana to Azure Monitor](#linking-grafana-to-azure-monitor)
-8. [Dashboards](#dashboards)
-9. [Alerting](#alerting)
-10. [Troubleshooting](#troubleshooting)
-11. [References](#references)
+7. [Network Policy Configuration](#network-policy-configuration)
+8. [Linking Grafana to Azure Monitor](#linking-grafana-to-azure-monitor)
+9. [Dashboards](#dashboards)
+10. [Alerting](#alerting)
+11. [Troubleshooting](#troubleshooting)
+12. [References](#references)
 
 ---
 
@@ -63,35 +64,55 @@ Before setting up the monitoring stack, ensure the following are in place:
 
 | Requirement | Details |
 |---|---|
-| AKS Cluster | Running with the Azure Monitor add-on enabled |
-| Azure CLI | Version 2.48.0 or later |
+| AKS Cluster | Running with the Azure Monitor add-on enabled (provisioned via Bicep) |
+| Bicep | Infrastructure-as-code templates for all Azure resources |
+| Azure DevOps Pipeline | CI/CD pipeline used to deploy Bicep templates and Kubernetes manifests |
 | kubectl | Configured to target the AKS cluster |
-| Helm | Version 3.x |
-| Azure Monitor Workspace | Created in the same or linked subscription |
-| Camunda | Deployed with Spring Boot Actuator and Prometheus metrics enabled |
+| Azure Monitor Workspace | Created and linked to AKS via Bicep |
+| Camunda | Deployed with Prometheus metrics enabled via environment variables |
 | Prometheus Operator CRDs | Installed in the cluster (required for PodMonitor) |
 
 ---
 
 ## Azure Managed Prometheus Setup
 
-Azure Managed Prometheus is provided as part of the **Azure Monitor managed service for Prometheus**. It integrates directly with AKS using the Azure Monitor metrics add-on.
+Azure Managed Prometheus is provided as part of the **Azure Monitor managed service for Prometheus**. It integrates directly with AKS via the Azure Monitor metrics add-on.
 
-### 1. Enable the Azure Monitor Metrics Add-on on AKS
+### 1. Provision via Bicep and Azure DevOps Pipeline
 
-```bash
-az aks update \
-  --resource-group <RESOURCE_GROUP> \
-  --name <AKS_CLUSTER_NAME> \
-  --enable-azure-monitor-metrics \
-  --azure-monitor-workspace-resource-id <AZURE_MONITOR_WORKSPACE_RESOURCE_ID>
+The Azure Monitor metrics add-on and the associated Azure Monitor Workspace are provisioned through the **Bicep templates** deployed by the **Azure DevOps pipeline**. The key Bicep configuration is the `azureMonitorProfile` property on the `managedCluster` resource:
+
+```bicep
+resource aksCluster 'Microsoft.ContainerService/managedClusters@2023-07-01' = {
+  // ...
+  properties: {
+    azureMonitorProfile: {
+      metrics: {
+        enabled: true
+        kubeStateMetrics: {
+          metricLabelsAllowlist: ''
+          metricAnnotationsAllowList: ''
+        }
+      }
+    }
+  }
+}
 ```
 
-> **Note:** Replace `<RESOURCE_GROUP>`, `<AKS_CLUSTER_NAME>`, and `<AZURE_MONITOR_WORKSPACE_RESOURCE_ID>` with your actual values.
+The Azure Monitor Workspace is created as a separate Bicep resource and its resource ID is passed into the cluster configuration:
+
+```bicep
+resource monitorWorkspace 'microsoft.monitor/accounts@2023-04-03' = {
+  name: monitorWorkspaceName
+  location: location
+}
+```
+
+Deploy these resources by triggering the **Azure DevOps pipeline** for the infrastructure stage. Refer to the pipeline definition in the repository for the exact stage and variable names.
 
 ### 2. Verify the Add-on is Running
 
-The add-on deploys the following components in the `kube-system` and `monitoring` namespaces:
+After deployment, confirm the monitoring agent pods are running:
 
 ```bash
 kubectl get pods -n kube-system | grep ama-metrics
@@ -114,63 +135,60 @@ Confirm that the workspace is active and linked to your AKS cluster.
 
 ## Azure Managed Grafana Setup
 
-### 1. Create an Azure Managed Grafana Instance
+### 1. Provision via Bicep and Azure DevOps Pipeline
 
-```bash
-az grafana create \
-  --name <GRAFANA_NAME> \
-  --resource-group <RESOURCE_GROUP> \
-  --location <LOCATION>
+The Azure Managed Grafana instance, its link to the Azure Monitor Workspace, and all required RBAC role assignments are provisioned through the **Bicep templates** deployed by the **Azure DevOps pipeline**:
+
+```bicep
+resource grafana 'Microsoft.Dashboard/grafana@2023-09-01' = {
+  name: grafanaName
+  location: location
+  sku: {
+    name: 'Standard'
+  }
+  identity: {
+    type: 'SystemAssigned'
+  }
+  properties: {
+    grafanaIntegrations: {
+      azureMonitorWorkspaceIntegrations: [
+        {
+          azureMonitorWorkspaceResourceId: monitorWorkspace.id
+        }
+      ]
+    }
+  }
+}
+
+// Grant the Grafana managed identity Monitoring Reader on the Azure Monitor Workspace
+resource grafanaMonitoringReader 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+  name: guid(monitorWorkspace.id, grafana.id, monitoringReaderRoleId)
+  scope: monitorWorkspace
+  properties: {
+    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', monitoringReaderRoleId)
+    principalId: grafana.identity.principalId
+    principalType: 'ServicePrincipal'
+  }
+}
 ```
 
-### 2. Link Grafana to the Azure Monitor Workspace
+Deploy these resources by triggering the **Azure DevOps pipeline** infrastructure stage.
 
-```bash
-az grafana update \
-  --name <GRAFANA_NAME> \
-  --resource-group <RESOURCE_GROUP> \
-  --integrations "{\"azureMonitorWorkspaceIntegrations\": [{\"azureMonitorWorkspaceResourceId\": \"<AZURE_MONITOR_WORKSPACE_RESOURCE_ID>\"}]}"
-```
+### 2. Verify the Grafana Data Source
 
-Alternatively, in the Azure Portal:
+After deployment, confirm the Azure Monitor data source is connected:
 
 1. Navigate to your **Azure Managed Grafana** instance.
 2. Go to **Configuration → Data Sources**.
-3. Confirm **Azure Monitor** is listed and connected.
-
-### 3. Assign Roles
-
-Ensure the Managed Grafana instance has the **Monitoring Reader** role on the Azure Monitor Workspace:
-
-```bash
-az role assignment create \
-  --assignee <GRAFANA_MANAGED_IDENTITY_PRINCIPAL_ID> \
-  --role "Monitoring Reader" \
-  --scope <AZURE_MONITOR_WORKSPACE_RESOURCE_ID>
-```
+3. Confirm **Azure Monitor** is listed and shows a green **Connected** status.
 
 ---
 
 ## Camunda Metrics Integration
 
-Camunda's Spring Boot-based engine can expose Prometheus metrics via the Spring Boot Actuator.
+Camunda's Spring Boot-based engine exposes Prometheus metrics via the Spring Boot Actuator. No code changes are required — metrics are enabled through environment variables set on the Kubernetes deployment.
 
-### 1. Enable Prometheus Metrics in Camunda
-
-Add the following dependencies to your `pom.xml`:
-
-```xml
-<dependency>
-    <groupId>org.springframework.boot</groupId>
-    <artifactId>spring-boot-starter-actuator</artifactId>
-</dependency>
-<dependency>
-    <groupId>io.micrometer</groupId>
-    <artifactId>micrometer-registry-prometheus</artifactId>
-</dependency>
-```
-
-### 2. Configure Prometheus via Environment Variables
+### 1. Configure Prometheus via Environment Variables
 
 Set the following environment variables on your Camunda deployment (e.g. in your Kubernetes `Deployment` or `StatefulSet`):
 
@@ -183,6 +201,23 @@ env:
 ```
 
 > These correspond to the Spring Boot properties `management.endpoint.prometheus.access` and `management.prometheus.metrics.export.enabled` as documented in the [Camunda Self-Managed Metrics guide](https://docs.camunda.io/docs/self-managed/operational-guides/monitoring/metrics/).
+
+### 2. Accessing the Metrics Endpoint
+
+Since Camunda pods are not exposed externally, use `kubectl port-forward` to verify the metrics endpoint locally:
+
+```bash
+# Forward the Camunda pod's HTTP port to localhost
+kubectl port-forward pod/<CAMUNDA_POD_NAME> 8080:8080 -n <CAMUNDA_NAMESPACE>
+```
+
+Then in a separate terminal:
+
+```bash
+curl http://localhost:8080/actuator/prometheus
+```
+
+You should see a plain-text list of metrics in the Prometheus exposition format. Look for entries beginning with `camunda_` to confirm Camunda-specific metrics are being exposed.
 
 ### 3. Key Camunda Metrics Available
 
@@ -197,11 +232,6 @@ Once configured, the following metric categories are exposed:
 | `camunda.bpmn.execution.time` | BPMN execution duration |
 | `jvm_memory_used_bytes` | JVM memory usage |
 | `http_server_requests_seconds` | HTTP request latency |
-
-> Verify metrics are available by hitting the endpoint directly:
-> ```
-> curl http://<CAMUNDA_POD_IP>:8080/actuator/prometheus
-> ```
 
 ---
 
@@ -252,6 +282,58 @@ kubectl logs -n kube-system -l app=ama-metrics --tail=100 | grep camunda
 ```
 
 You can also query metrics in the Azure Monitor Workspace using **Metrics Explorer** or the **Prometheus query interface**.
+
+---
+
+## Network Policy Configuration
+
+Kubernetes `NetworkPolicy` resources are used to restrict pod-to-pod traffic in the cluster. To allow the Azure Monitor metrics agent (`ama-metrics`) running in the `kube-system` namespace to scrape Camunda pods, a `NetworkPolicy` must explicitly permit that ingress traffic.
+
+### NetworkPolicy YAML
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: camunda-allow-ama-metrics-scraping
+  namespace: <CAMUNDA_NAMESPACE>
+spec:
+  podSelector:
+    matchLabels:
+      app: camunda          # Selects all Camunda component pods
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              rsName: ama-metrics   # Label present on the ama-metrics agent pods
+      ports:
+        - protocol: TCP
+          port: 8080                # The port on which /actuator/prometheus is served
+```
+
+> **Note:** The `namespaceSelector` and `podSelector` are combined with an AND condition (both must match). This ensures only the `ama-metrics` pods in `kube-system` are granted access — not all pods in `kube-system`.
+
+### Apply the NetworkPolicy
+
+The `NetworkPolicy` is deployed as part of the Kubernetes manifests via the **Azure DevOps pipeline**:
+
+```bash
+kubectl apply -f camunda-allow-ama-metrics-scraping.yaml
+```
+
+### Verify the Policy
+
+Confirm the policy has been applied and check the labels on the `ama-metrics` pods match:
+
+```bash
+kubectl get networkpolicy camunda-allow-ama-metrics-scraping -n <CAMUNDA_NAMESPACE>
+kubectl get pods -n kube-system -l rsName=ama-metrics --show-labels
+```
 
 ---
 
@@ -378,5 +460,8 @@ camunda_incident_open > 5
 - [Azure Managed Grafana documentation](https://learn.microsoft.com/en-us/azure/managed-grafana/overview)
 - [Enable Prometheus metrics on AKS](https://learn.microsoft.com/en-us/azure/aks/monitor-aks)
 - [Prometheus PodMonitor CRD](https://prometheus-operator.dev/docs/operator/api/#monitoring.coreos.com/v1.PodMonitor)
-- [Camunda Metrics with Micrometer](https://docs.camunda.org/manual/latest/user-guide/process-engine/metrics/)
-- [Spring Boot Actuator - Prometheus](https://docs.spring.io/spring-boot/docs/current/reference/html/actuator.html#actuator.metrics.export.prometheus)
+- [Camunda Self-Managed Metrics guide](https://docs.camunda.io/docs/self-managed/operational-guides/monitoring/metrics/)
+- [Bicep – AKS Azure Monitor Profile](https://learn.microsoft.com/en-us/azure/templates/microsoft.containerservice/managedclusters)
+- [Bicep – Azure Managed Grafana](https://learn.microsoft.com/en-us/azure/templates/microsoft.dashboard/grafana)
+- [Azure DevOps Pipelines documentation](https://learn.microsoft.com/en-us/azure/devops/pipelines/)
+- [Kubernetes NetworkPolicy](https://kubernetes.io/docs/concepts/services-networking/network-policies/)
