@@ -417,6 +417,216 @@ camunda_incident_open > 5
 
 ## Troubleshooting
 
+### Metrics Not Generating
+
+Use this step-by-step guide when metrics are not appearing in Azure Monitor or Grafana. Work through each section in order — most issues are caught in the first few steps.
+
+> **Reference:** [Troubleshoot collection of Prometheus metrics in Azure Monitor](https://learn.microsoft.com/en-us/azure/azure-monitor/containers/prometheus-metrics-troubleshoot)
+
+#### Step 1 — Verify the Azure Monitor Metrics Add-on is Enabled
+
+Confirm the add-on is active on your AKS cluster:
+
+```bash
+az aks show \
+  --resource-group <RESOURCE_GROUP> \
+  --name <CLUSTER_NAME> \
+  --query "azureMonitorProfile.metrics.enabled"
+```
+
+The output should be `true`. If it is `false` or `null`, re-run the Bicep deployment via the **Azure DevOps pipeline** to re-enable the add-on.
+
+#### Step 2 — Check the ama-metrics Pods are Running
+
+```bash
+kubectl get pods -n kube-system | grep ama-metrics
+```
+
+Expected output includes the following pods in `Running` state:
+
+| Pod | Purpose |
+|---|---|
+| `ama-metrics-*` | Main Prometheus scraping agent |
+| `ama-metrics-node-*` | Per-node metrics collector |
+| `ama-metrics-ksm-*` | kube-state-metrics sidecar |
+
+If any pods are in `CrashLoopBackOff`, `Pending`, or `Error` state, check the logs:
+
+```bash
+kubectl logs -n kube-system <AMA_METRICS_POD_NAME> --previous
+kubectl describe pod -n kube-system <AMA_METRICS_POD_NAME>
+```
+
+Common causes of pod failure:
+- Insufficient node resources — check node capacity with `kubectl describe node`.
+- Missing or revoked managed identity permissions on the Azure Monitor Workspace.
+
+#### Step 3 — Verify the Azure Monitor Workspace Linkage
+
+1. In the Azure Portal, navigate to your **AKS cluster → Insights → Monitor settings**.
+2. Confirm an **Azure Monitor Workspace** is shown as linked.
+3. Alternatively, inspect the Bicep-deployed resource:
+
+```bash
+az aks show \
+  --resource-group <RESOURCE_GROUP> \
+  --name <CLUSTER_NAME> \
+  --query "azureMonitorProfile"
+```
+
+If no workspace is linked, re-trigger the infrastructure stage of the **Azure DevOps pipeline** to reapply the Bicep templates.
+
+#### Step 4 — Check Prometheus Operator CRDs are Installed
+
+Azure Managed Prometheus relies on Custom Resource Definitions (CRDs) for `PodMonitor` and `ServiceMonitor`:
+
+```bash
+kubectl get crd | grep -E "podmonitor|servicemonitor"
+```
+
+You should see output similar to:
+
+```
+podmonitors.azmonitoring.coreos.com
+servicemonitors.azmonitoring.coreos.com
+```
+
+If the CRDs are missing, the metrics add-on pods may not have installed correctly. Re-deploy the add-on by re-running the Azure DevOps pipeline.
+
+#### Step 5 — Validate the PodMonitor Configuration
+
+Verify the `PodMonitor` exists in the correct namespace:
+
+```bash
+kubectl get podmonitor -n <CAMUNDA_NAMESPACE>
+```
+
+Inspect its configuration:
+
+```bash
+kubectl describe podmonitor camunda-podmonitor -n <CAMUNDA_NAMESPACE>
+```
+
+Check the following:
+
+| Field | What to verify |
+|---|---|
+| `spec.selector.matchLabels` | Labels must exactly match labels on Camunda pods |
+| `podMetricsEndpoints[].port` | Must match a **named** port in the pod spec (not just a number) |
+| `podMetricsEndpoints[].path` | Should be `/actuator/prometheus` |
+| `namespaceSelector.matchNames` | Must include the namespace where Camunda pods run |
+| `apiVersion` | Should be `azmonitoring.coreos.com/v1` for Azure Managed Prometheus |
+
+Cross-check pod labels:
+
+```bash
+kubectl get pods -n <CAMUNDA_NAMESPACE> --show-labels
+```
+
+#### Step 6 — Check the Network Policy Allows Scraping
+
+If `NetworkPolicy` resources are active in the cluster, ingress from the `ama-metrics` agent must be explicitly allowed. Verify the policy is in place:
+
+```bash
+kubectl get networkpolicy camunda-allow-ama-metrics-scraping -n <CAMUNDA_NAMESPACE>
+```
+
+Confirm the `ama-metrics` agent pods carry the expected label:
+
+```bash
+kubectl get pods -n kube-system -l rsName=ama-metrics --show-labels
+```
+
+If the label has changed, update the `NetworkPolicy` selector accordingly. See the [Network Policy Configuration](#network-policy-configuration) section for the full manifest.
+
+You can also do a quick connectivity test by running `curl` from within an `ama-metrics` pod:
+
+```bash
+kubectl exec -it -n kube-system <AMA_METRICS_POD_NAME> -- \
+  curl http://<CAMUNDA_POD_IP>:8080/actuator/prometheus
+```
+
+#### Step 7 — Inspect the ama-metrics Agent Scrape Logs
+
+Look for scrape errors or target discovery issues in the agent logs:
+
+```bash
+# Tail the main agent log
+kubectl logs -n kube-system -l app=ama-metrics --tail=200
+
+# Filter for errors
+kubectl logs -n kube-system -l app=ama-metrics --tail=500 | grep -i "error\|fail\|warn\|camunda"
+```
+
+Key log messages to look for:
+
+| Log message | Likely cause |
+|---|---|
+| `connection refused` | Camunda pod not listening on the expected port |
+| `context deadline exceeded` | Network policy blocking scrape traffic |
+| `no such host` | DNS resolution failure for the pod |
+| `TLS handshake error` | Scheme mismatch (`https` used when pod expects `http`) |
+| `podmonitor … not found` | CRD not installed or wrong `apiVersion` |
+
+#### Step 8 — Verify the Camunda Metrics Endpoint
+
+Confirm Camunda is actively exposing metrics:
+
+```bash
+# Port-forward the pod locally
+kubectl port-forward pod/<CAMUNDA_POD_NAME> 8080:8080 -n <CAMUNDA_NAMESPACE>
+
+# In a separate terminal
+curl http://localhost:8080/actuator/prometheus | head -20
+```
+
+If the endpoint returns an error or is empty:
+- Confirm the environment variables `MANAGEMENT_ENDPOINT_PROMETHEUS_ACCESS=unrestricted` and `MANAGEMENT_PROMETHEUS_METRICS_EXPORT_ENABLED=true` are set (see [Camunda Metrics Integration](#camunda-metrics-integration)).
+- Check Camunda pod logs for Spring Boot startup errors:
+
+```bash
+kubectl logs <CAMUNDA_POD_NAME> -n <CAMUNDA_NAMESPACE> | grep -i "actuator\|prometheus\|error"
+```
+
+#### Step 9 — Confirm Metrics Arriving in the Azure Monitor Workspace
+
+Use the **Prometheus query interface** in the Azure Portal to check whether any metrics have been ingested:
+
+1. Navigate to **Azure Monitor → Managed Prometheus → \<Your Workspace\> → Prometheus Explorer**.
+2. Run a simple query to check for any metric:
+   ```promql
+   up
+   ```
+3. Run a Camunda-specific query:
+   ```promql
+   camunda_process_instance_running
+   ```
+
+If `up` returns data but Camunda metrics do not, the scrape target is reachable but the PodMonitor selector or path is misconfigured — revisit Step 5.
+
+If `up` returns no data at all, the agent is not scraping any targets — revisit Steps 2–4.
+
+#### Step 10 — Review the ama-metrics ConfigMap
+
+Azure Managed Prometheus uses a `ConfigMap` to control scrape configuration and feature flags. Inspect it for any overrides that may suppress scraping:
+
+```bash
+kubectl get configmap -n kube-system | grep ama-metrics
+kubectl describe configmap ama-metrics-settings-configmap -n kube-system
+```
+
+Ensure custom scraping is enabled if you have overridden the default `ConfigMap`:
+
+```yaml
+schema-version: v1
+default-scrape-settings-enabled: true
+pod-annotation-based-scraping: false   # set to true if using pod annotations
+```
+
+> **Note:** If `default-scrape-settings-enabled` is set to `false`, the agent will not automatically discover `PodMonitor` or `ServiceMonitor` resources.
+
+---
+
 ### PodMonitor Not Scraping Pods
 
 - **Check labels:** Ensure the `matchLabels` in the `PodMonitor` exactly match the labels on your Camunda pods.
@@ -465,3 +675,4 @@ camunda_incident_open > 5
 - [Bicep – Azure Managed Grafana](https://learn.microsoft.com/en-us/azure/templates/microsoft.dashboard/grafana)
 - [Azure DevOps Pipelines documentation](https://learn.microsoft.com/en-us/azure/devops/pipelines/)
 - [Kubernetes NetworkPolicy](https://kubernetes.io/docs/concepts/services-networking/network-policies/)
+- [Troubleshoot collection of Prometheus metrics in Azure Monitor](https://learn.microsoft.com/en-us/azure/azure-monitor/containers/prometheus-metrics-troubleshoot)
