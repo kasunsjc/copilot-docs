@@ -1,35 +1,114 @@
-# Migrating from NGINX to Traefik
+# Traefik — Overview and Migration from NGINX
 
 ## Overview
 
-This document describes the process of migrating from **NGINX** to **Traefik** in a Kubernetes environment. Routes are defined using Traefik's **file provider** (a YAML dynamic configuration file mounted into the Traefik pod via a ConfigMap). Traffic transformations — such as URL rewrite rules and CORS — are handled by **Traefik `Middleware` CRDs**.
+This document is the general reference for running **Traefik** as the ingress proxy in our Kubernetes environment. It explains what Traefik is, why we are moving away from NGINX (including the retirement of the NGINX Ingress Controller), how our Traefik setup is structured, and how to perform the migration.
 
-This approach does **not** use Kubernetes `Ingress` resources, Gateway API resources, or Traefik `IngressRoute` / `IngressRouteTCP` CRDs for routing.
+In our environment, routes are defined using Traefik's **file provider** (a YAML dynamic configuration file mounted into the Traefik pod via a ConfigMap). Traffic transformations — such as URL rewrite rules and CORS — are handled by **Traefik `Middleware` CRDs**. We do **not** use Kubernetes `Ingress` resources, Gateway API resources, or Traefik `IngressRoute` / `IngressRouteTCP` CRDs for routing.
 
 ---
 
 ## Table of Contents
 
-1. [Prerequisites](#prerequisites)
-2. [Key Differences](#key-differences)
-3. [Routing Architecture](#routing-architecture)
-4. [Traefik Middlewares](#traefik-middlewares)
+1. [What is Traefik?](#what-is-traefik)
+2. [Why Migrate: NGINX Ingress Retirement](#why-migrate-nginx-ingress-retirement)
+3. [Why Choose Traefik](#why-choose-traefik)
+4. [Key Differences](#key-differences)
+5. [Prerequisites](#prerequisites)
+6. [Routing Architecture](#routing-architecture)
+7. [Traefik Middlewares](#traefik-middlewares)
    - [URL Rewrite Rules](#url-rewrite-rules)
    - [CORS Configuration](#cors-configuration)
    - [HTTPS Redirect](#https-redirect)
-5. [File Provider — Dynamic Route Configuration](#file-provider--dynamic-route-configuration)
+8. [File Provider — Dynamic Route Configuration](#file-provider--dynamic-route-configuration)
    - [Full Example](#full-example)
    - [Referencing Middleware CRDs from the File Provider](#referencing-middleware-crds-from-the-file-provider)
-6. [Applying Configuration to the Cluster](#applying-configuration-to-the-cluster)
-7. [Installation Script](#installation-script)
-8. [Verification](#verification)
-9. [Rollback Procedure](#rollback-procedure)
-10. [Troubleshooting](#troubleshooting)
-11. [References](#references)
+9. [Applying Configuration to the Cluster](#applying-configuration-to-the-cluster)
+10. [Installation Script](#installation-script)
+11. [Verification](#verification)
+12. [Rollback Procedure](#rollback-procedure)
+13. [Troubleshooting](#troubleshooting)
+14. [References](#references)
 
 ---
 
-## Prerequisites
+## What is Traefik?
+
+**Traefik** (pronounced _traffic_) is a modern, cloud-native reverse proxy and load balancer designed for dynamic environments such as Kubernetes, Docker, and service meshes. Unlike traditional proxies that require manual configuration restarts, Traefik automatically discovers services and updates its routing configuration in real time.
+
+### Core concepts
+
+| Concept | Description |
+|---|---|
+| **EntryPoint** | The network port Traefik listens on (e.g., port `80` for HTTP, port `443` for HTTPS). |
+| **Router** | Matches an incoming request (by host, path, headers, etc.) and forwards it to a service. Routers can attach one or more middlewares. |
+| **Middleware** | A processing step applied to a request or response before it reaches the backend — e.g., path rewriting, CORS headers, rate limiting, authentication. |
+| **Service** | The upstream backend (Kubernetes Service, URL, etc.) that Traefik forwards matched requests to. |
+| **Provider** | The source of Traefik's dynamic configuration. Common providers include `kubernetesCRD`, `kubernetesIngress`, and `file`. In our setup the primary routing provider is `file`. |
+
+### How Traefik works
+
+```
+                        ┌──────────────────────────────────────────┐
+                        │               Traefik                    │
+                        │                                          │
+  Incoming Request      │  EntryPoint ──▶ Router ──▶ Middlewares  │
+ ──────────────────────▶│   (:80/:443)    (rules)    (rewrite,     │
+                        │                             CORS, auth)  │
+                        │                     │                    │
+                        └─────────────────────┼────────────────────┘
+                                              │
+                                              ▼
+                                   ┌─────────────────┐
+                                   │  Backend Service │
+                                   │  (Kubernetes     │
+                                   │   ClusterIP)     │
+                                   └─────────────────┘
+```
+
+Traefik reads its routing rules from one or more **providers**. When a provider's configuration changes (e.g., a ConfigMap is updated), Traefik reloads its routing table with **zero downtime** — no pod restart or reload signal is needed.
+
+---
+
+## Why Migrate: NGINX Ingress Retirement
+
+The **NGINX Ingress Controller** (`kubernetes/ingress-nginx`) — the most widely used Kubernetes ingress controller — has reached **end-of-life**. The Kubernetes project announced that it will no longer receive new features, and active maintenance will wind down. The key points are:
+
+- **Kubernetes SIG-Network** officially announced the deprecation and eventual retirement of `ingress-nginx` in favour of the **Gateway API**, which supersedes the older `networking.k8s.io/v1 Ingress` resource.
+- Security patches and bug fixes for `ingress-nginx` will become increasingly limited over time.
+- The `networking.k8s.io/v1 Ingress` API itself is considered a legacy API — it lacks the expressiveness needed for modern traffic management (e.g., traffic splitting, header-based routing, advanced middleware chains).
+- Staying on a deprecated, unmaintained ingress controller increases operational risk: vulnerabilities (e.g., the critical `ingress-nginx` remote code execution CVEs in 2024–2025) will go unpatched.
+
+### What this means for us
+
+| Risk | Detail |
+|---|---|
+| Security vulnerabilities | No new patches for NGINX Ingress CVEs after EOL |
+| No new features | Traffic management capabilities are frozen |
+| Kubernetes version compatibility | Future Kubernetes versions may drop `Ingress` API support |
+| Community support | Issue reports and PRs on `ingress-nginx` will go unaddressed |
+
+Migrating to **Traefik** with the **file provider** addresses all of these risks: Traefik is actively maintained, has a strong roadmap, and supports modern traffic management patterns without depending on the deprecated `Ingress` API.
+
+---
+
+## Why Choose Traefik
+
+| Capability | Traefik | NGINX Ingress |
+|---|---|---|
+| **Active maintenance** | ✅ Actively developed by Traefik Labs | ⚠️ Entering retirement |
+| **Zero-downtime config reload** | ✅ Native hot reload via provider watch | ❌ Requires reload signal |
+| **Built-in dashboard** | ✅ Web UI showing all routers, middlewares, services | ❌ Not available |
+| **Middleware as code** | ✅ `Middleware` CRDs — reusable, version-controlled | ❌ Inline annotations per Ingress resource |
+| **Multiple config sources** | ✅ File, CRD, Docker, Consul, etc. — composable | ❌ Only Kubernetes Ingress API |
+| **Traffic splitting / canary** | ✅ Native weighted round-robin | ❌ Requires external tooling |
+| **Observability** | ✅ Built-in metrics (Prometheus), tracing (OpenTelemetry), access logs | ⚠️ Limited, via annotations |
+| **TLS automation** | ✅ Let's Encrypt / ACME built in | ❌ External cert-manager required |
+| **No Ingress API dependency** | ✅ File provider routes bypass the deprecated Ingress API | ❌ Tightly coupled to `networking.k8s.io/v1 Ingress` |
+
+---
+
+## Key Differences
 
 Before starting the migration, ensure the following are in place:
 
@@ -668,6 +747,7 @@ kubectl apply -f nginx-config-backup.yaml
 
 ## References
 
+- [Traefik Documentation](https://doc.traefik.io/traefik/)
 - [Traefik File Provider Documentation](https://doc.traefik.io/traefik/providers/file/)
 - [Traefik Middleware Reference](https://doc.traefik.io/traefik/middlewares/overview/)
 - [Traefik Headers Middleware (CORS)](https://doc.traefik.io/traefik/middlewares/http/headers/)
@@ -676,3 +756,6 @@ kubectl apply -f nginx-config-backup.yaml
 - [Traefik Routers (HTTP)](https://doc.traefik.io/traefik/routing/routers/)
 - [Traefik Helm Chart](https://github.com/traefik/traefik-helm-chart)
 - [Traefik Kubernetes CRD Provider](https://doc.traefik.io/traefik/providers/kubernetes-crd/)
+- [NGINX Ingress Controller — End of Life Announcement](https://kubernetes.github.io/ingress-nginx/)
+- [Kubernetes Gateway API (replacement for Ingress)](https://gateway-api.sigs.k8s.io/)
+- [Kubernetes Ingress API — Legacy Status](https://kubernetes.io/docs/concepts/services-networking/ingress/)
