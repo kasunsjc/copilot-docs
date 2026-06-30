@@ -17,6 +17,7 @@ In our environment, routes are defined using Traefik's **file provider** (a YAML
 5. [Prerequisites](#prerequisites)
 6. [Routing Architecture](#routing-architecture)
 7. [Traefik Middlewares](#traefik-middlewares)
+   - [Using Middleware with Kubernetes Ingress Annotations (Optional)](#using-middleware-with-kubernetes-ingress-annotations-optional)
    - [URL Rewrite Rules](#url-rewrite-rules)
    - [CORS Configuration](#cors-configuration)
    - [HTTPS Redirect](#https-redirect)
@@ -172,6 +173,51 @@ Before starting the migration, ensure the following are in place:
 ## Traefik Middlewares
 
 `Middleware` CRDs are applied to named routers inside the file provider configuration. Define each middleware in its own manifest and apply it to the cluster.
+
+### Using Middleware with Kubernetes Ingress Annotations (Optional)
+
+> Our production setup uses the **file provider** (not `Ingress` resources). This section is for teams that also enable Traefik's `kubernetesIngress` provider.
+
+You can attach one or more `Middleware` CRDs to an `Ingress` by using the `traefik.ingress.kubernetes.io/router.middlewares` annotation:
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: my-app-ingress
+  namespace: production
+  annotations:
+    kubernetes.io/ingress.class: traefik
+    traefik.ingress.kubernetes.io/router.middlewares: production-rewrite-api-path@kubernetescrd,production-cors-headers@kubernetescrd
+spec:
+  rules:
+    - host: my-app.example.com
+      http:
+        paths:
+          - path: /api
+            pathType: Prefix
+            backend:
+              service:
+                name: my-app-service
+                port:
+                  number: 80
+```
+
+#### Annotation Pattern Breakdown
+
+Pattern:
+
+```text
+traefik.ingress.kubernetes.io/router.middlewares: <namespace>-<middleware-name>@kubernetescrd[,<namespace>-<middleware-name>@kubernetescrd...]
+```
+
+Parts:
+- `traefik.ingress.kubernetes.io/router.middlewares` — Traefik annotation key used to bind middleware chain to the Ingress router.
+- `<namespace>` — Kubernetes namespace where the `Middleware` CRD exists.
+- `-` — required separator between namespace and middleware resource name.
+- `<middleware-name>` — value from `metadata.name` of the `Middleware` CRD.
+- `@kubernetescrd` — provider suffix telling Traefik the middleware comes from CRDs.
+- `,` — optional separator for multiple middlewares, applied left-to-right.
 
 ### URL Rewrite Rules
 
@@ -708,6 +754,15 @@ kubectl apply -f nginx-config-backup.yaml
   middlewares:
     - production-cors-headers@kubernetescrd
   ```
+- If using Kubernetes `Ingress` annotations, confirm the same pattern in `traefik.ingress.kubernetes.io/router.middlewares`:
+  ```yaml
+  traefik.ingress.kubernetes.io/router.middlewares: production-rewrite-api-path@kubernetescrd,production-cors-headers@kubernetescrd
+  ```
+- Common annotation mistakes:
+  - Using `/` instead of `-` between namespace and middleware name.
+  - Missing `@kubernetescrd` suffix.
+  - Referencing a middleware from the wrong namespace.
+  - Adding spaces around commas in middleware chains.
 - If using inline file provider middlewares, use `@file` instead:
   ```yaml
   middlewares:
@@ -756,6 +811,7 @@ kubectl apply -f nginx-config-backup.yaml
 - [Traefik Routers (HTTP)](https://doc.traefik.io/traefik/routing/routers/)
 - [Traefik Helm Chart](https://github.com/traefik/traefik-helm-chart)
 - [Traefik Kubernetes CRD Provider](https://doc.traefik.io/traefik/providers/kubernetes-crd/)
+- [Traefik Kubernetes Ingress Provider](https://doc.traefik.io/traefik/providers/kubernetes-ingress/)
 - [NGINX Ingress Controller — End of Life Announcement](https://kubernetes.github.io/ingress-nginx/)
 - [Kubernetes Gateway API (replacement for Ingress)](https://gateway-api.sigs.k8s.io/)
 - [Kubernetes Ingress API — Legacy Status](https://kubernetes.io/docs/concepts/services-networking/ingress/)
