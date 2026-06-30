@@ -4,7 +4,7 @@
 
 This document is the general reference for running **Traefik** as the ingress proxy in our Kubernetes environment. It explains what Traefik is, why we are moving away from NGINX (including the retirement of the NGINX Ingress Controller), how our Traefik setup is structured, and how to perform the migration.
 
-In our environment, routes are defined using Traefik's **file provider** (a YAML dynamic configuration file mounted into the Traefik pod via a ConfigMap). Traffic transformations — such as URL rewrite rules and CORS — are handled by **Traefik `Middleware` CRDs**. We do **not** use Kubernetes `Ingress` resources, Gateway API resources, or Traefik `IngressRoute` / `IngressRouteTCP` CRDs for routing.
+In our environment, routes are primarily defined using Traefik's **file provider** (a YAML dynamic configuration file mounted into the Traefik pod via a ConfigMap). Traffic transformations — such as URL rewrite rules and CORS — are handled by **Traefik `Middleware` CRDs**. Kubernetes `Ingress` resources can also be enabled when needed through the `kubernetesIngress` provider.
 
 ---
 
@@ -24,7 +24,10 @@ In our environment, routes are defined using Traefik's **file provider** (a YAML
 8. [File Provider — Dynamic Route Configuration](#file-provider--dynamic-route-configuration)
    - [Full Example](#full-example)
    - [Referencing Middleware CRDs from the File Provider](#referencing-middleware-crds-from-the-file-provider)
+   - [File Provider TLS Certificates via ConfigMap](#file-provider-tls-certificates-via-configmap)
 9. [Applying Configuration to the Cluster](#applying-configuration-to-the-cluster)
+   - [Helm Values Example (Custom Cert + Ingress + File Provider)](#helm-values-example-custom-cert--ingress--file-provider)
+   - [Optional Ingress Resource Example](#optional-ingress-resource-example)
 10. [Installation Script](#installation-script)
 11. [Verification](#verification)
 12. [Rollback Procedure](#rollback-procedure)
@@ -166,7 +169,8 @@ Before starting the migration, ensure the following are in place:
 **Key points:**
 - Routers and backend services are declared in a **file provider** ConfigMap (Traefik dynamic configuration).
 - Middlewares are declared as **`Middleware` CRDs** and referenced by name from the file provider config.
-- No `Ingress`, `IngressRoute`, or Gateway API resources are needed.
+- `Ingress` resources are optional and can be enabled through `providers.kubernetesIngress.enabled=true`.
+- `IngressRoute` and Gateway API resources are not required for this setup.
 
 ---
 
@@ -438,6 +442,31 @@ middlewares:
   - cors-headers@file
 ```
 
+### File Provider TLS Certificates via ConfigMap
+
+When using custom certificates, keep TLS routing config in the file provider ConfigMap and mount cert files into the Traefik pod.
+
+```yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: traefik-tls-config
+  namespace: traefik
+data:
+  tls.yaml: |
+    tls:
+      stores:
+        default:
+          defaultCertificate:
+            certFile: /mnt/certs/tls.crt
+            keyFile: /mnt/certs/tls.key
+      certificates:
+        - certFile: /mnt/certs/tls.crt
+          keyFile: /mnt/certs/tls.key
+```
+
+This allows Traefik to load certificate paths from mounted files instead of embedding certificate material in Kubernetes Secrets.
+
 ---
 
 ## Applying Configuration to the Cluster
@@ -456,34 +485,84 @@ kubectl apply -f middlewares/https-redirect.yaml
 kubectl apply -f traefik-dynamic-config.yaml
 ```
 
-### Step 3 — Mount the ConfigMap into Traefik
+### Step 3 — Helm Values Example (Custom Cert + Ingress + File Provider)
 
-Configure Traefik to load the file provider by passing Helm values at install time (or during upgrade):
+Use Helm values like the following when you need custom TLS certificate files, Traefik file-provider config from a ConfigMap, and Kubernetes Ingress resources enabled.
 
 ```yaml
 # traefik-values.yaml
+providers:
+  kubernetesCRD:
+    enabled: true
+  kubernetesIngress:
+    enabled: true
+
+ingressClass:
+  enabled: true
+  isDefaultClass: true
+
 additionalVolumes:
+  - name: secrets-store-inline
+    csi:
+      driver: secrets-store.csi.k8s.io
+      readOnly: true
+      volumeAttributes:
+        secretProviderClass: kv-agw-tls
   - name: dynamic-config
     configMap:
-      name: traefik-dynamic-config
+      name: traefik-tls-config
 
 additionalVolumeMounts:
+  - name: secrets-store-inline
+    mountPath: /mnt/certs
+    readOnly: true
   - name: dynamic-config
-    mountPath: /etc/traefik/dynamic
+    mountPath: /dynamic
     readOnly: true
 
 additionalArguments:
-  - "--providers.file.directory=/etc/traefik/dynamic"
+  - "--providers.file.directory=/dynamic"
   - "--providers.file.watch=true"
-  - "--providers.kubernetescrd.enabled=true"
 ```
 
-Apply the updated values:
+### Step 4 — Optional Ingress Resource Example
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: my-app-ingress
+  namespace: production
+  annotations:
+    traefik.ingress.kubernetes.io/router.entrypoints: websecure
+    traefik.ingress.kubernetes.io/router.tls: "true"
+    traefik.ingress.kubernetes.io/router.middlewares: production-rewrite-api-path@kubernetescrd,production-cors-headers@kubernetescrd
+spec:
+  ingressClassName: traefik
+  rules:
+    - host: my-app.example.com
+      http:
+        paths:
+          - path: /api
+            pathType: Prefix
+            backend:
+              service:
+                name: my-app-service
+                port:
+                  number: 80
+```
+
+### Step 5 — Apply or Upgrade Traefik
 
 ```bash
+kubectl apply -f traefik-dynamic-config.yaml
+kubectl apply -f traefik-tls-config.yaml
+
 helm upgrade traefik traefik/traefik \
   --namespace traefik \
   --values traefik-values.yaml
+
+kubectl apply -f my-app-ingress.yaml
 ```
 
 > **Hot reload:** With `--providers.file.watch=true`, Traefik automatically picks up changes to the ConfigMap without a restart.
@@ -656,9 +735,11 @@ DYNAMIC_CONFIG_CM=traefik-routes \
 3. **Uninstalls NGINX** — if found, runs `helm uninstall` and waits for pods to terminate.
 4. **Installs Traefik** — adds the official Helm repo, creates the namespace if needed, and installs Traefik with:
    - **Kubernetes CRD provider** enabled (for `Middleware` CRDs).
-   - **Kubernetes Ingress provider disabled** (not used).
+   - **Kubernetes Ingress provider disabled by default** in this migration script.
    - **File provider** mounted from the `traefik-dynamic-config` ConfigMap (if it exists in the namespace).
 5. **Verifies deployment** — waits for the rollout to complete and reports the LoadBalancer IP.
+
+> If you need Ingress resources and custom certificate file mounting, use the Helm values pattern in **Step 3** of the previous section.
 
 ---
 
@@ -676,6 +757,19 @@ kubectl get pods -n traefik
 
 ```bash
 kubectl logs -n traefik -l app.kubernetes.io/name=traefik | grep -i "file provider\|dynamic"
+```
+
+### Verify custom certificate files are mounted
+
+```bash
+kubectl exec -n traefik deploy/traefik -- ls /mnt/certs
+```
+
+### Verify Ingress resources are picked up (if enabled)
+
+```bash
+kubectl get ingress -A
+kubectl logs -n traefik -l app.kubernetes.io/name=traefik | grep -i ingress
 ```
 
 ### Access the Traefik dashboard
@@ -731,7 +825,7 @@ kubectl apply -f nginx-config-backup.yaml
 
 - Confirm the dynamic config ConfigMap is mounted correctly:
   ```bash
-  kubectl exec -n traefik deploy/traefik -- ls /etc/traefik/dynamic/
+  kubectl exec -n traefik deploy/traefik -- ls /dynamic
   ```
 - Confirm the file provider argument is set:
   ```bash
@@ -773,6 +867,28 @@ kubectl apply -f nginx-config-backup.yaml
   kubectl logs -n traefik -l app.kubernetes.io/name=traefik | grep -i middleware
   ```
 
+### Custom Certificate Not Applied
+
+- Verify certificate files exist in the pod:
+  ```bash
+  kubectl exec -n traefik deploy/traefik -- ls /mnt/certs
+  ```
+- Verify the TLS file-provider ConfigMap is mounted:
+  ```bash
+  kubectl exec -n traefik deploy/traefik -- ls /dynamic
+  ```
+- Verify `tls.yaml` points to valid cert and key file paths:
+  ```yaml
+  tls:
+    certificates:
+      - certFile: /mnt/certs/tls.crt
+        keyFile: /mnt/certs/tls.key
+  ```
+- Check logs for certificate load errors:
+  ```bash
+  kubectl logs -n traefik -l app.kubernetes.io/name=traefik | grep -i "tls\|certificate\|x509"
+  ```
+
 ### CORS Errors in Browser
 
 - Ensure `addVaryHeader: true` is set in the `headers` Middleware.
@@ -812,6 +928,7 @@ kubectl apply -f nginx-config-backup.yaml
 - [Traefik Helm Chart](https://github.com/traefik/traefik-helm-chart)
 - [Traefik Kubernetes CRD Provider](https://doc.traefik.io/traefik/providers/kubernetes-crd/)
 - [Traefik Kubernetes Ingress Provider](https://doc.traefik.io/traefik/providers/kubernetes-ingress/)
+- [Traefik TLS Certificates](https://doc.traefik.io/traefik/https/tls/)
 - [NGINX Ingress Controller — End of Life Announcement](https://kubernetes.github.io/ingress-nginx/)
 - [Kubernetes Gateway API (replacement for Ingress)](https://gateway-api.sigs.k8s.io/)
 - [Kubernetes Ingress API — Legacy Status](https://kubernetes.io/docs/concepts/services-networking/ingress/)
