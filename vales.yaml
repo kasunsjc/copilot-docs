@@ -1,0 +1,129 @@
+deployment:
+  enabled: true
+  kind: Deployment
+  replicas: 3
+  terminationGracePeriodSeconds: 60
+  minReadySeconds: 10
+  healthchecksPort: 8443  
+  healthchecksScheme: HTTPS  
+  readinessPath: "/ping"
+  livenessPath: "/ping"
+  additionalVolumes:
+    - name: secrets-store-inline
+      csi:
+        driver: secrets-store.csi.k8s.io
+        readOnly: true
+        volumeAttributes:
+          secretProviderClass: "kv-agw-tls"
+    - name: dynamic-config
+      configMap:
+        name: traefik-tls-config
+ingressClass:  
+  enabled: true
+  isDefaultClass: true
+updateStrategy:  
+  type: RollingUpdate
+  rollingUpdate:
+    maxUnavailable: 0  
+    maxSurge: 1        
+providers:
+  kubernetesCRD:
+    enabled: true
+  kubernetesIngress:
+    enabled: true
+additionalVolumeMounts: 
+  - name: secrets-store-inline
+    mountPath: /mnt/certs
+    readOnly: true
+  - name: dynamic-config
+    mountPath: /dynamic
+    readOnly: true
+logs:
+  general:
+    level: "INFO"  
+  access:
+    enabled: true
+    format: json 
+    timezone: "TZ/Europe/Amsterdam"
+    fields:
+      general:
+        defaultmode: keep  
+      headers:
+        defaultmode: drop  
+  noColor: true
+metrics:
+  prometheus:
+    entryPoint: metrics
+additionalArguments:
+  - "--providers.file.directory=/dynamic"
+  - "--providers.file.watch=true"
+  - "--ping"
+  - "--ping.entrypoint=websecure"
+global:
+  checkNewVersion: false
+ports:
+  traefik:
+    port: 8080
+    expose:
+      default: false
+    exposedPort: 8080
+    protocol: TCP
+  web:
+    asDefault: 
+    port: 8000
+    expose:
+      default: true
+    exposedPort: 80
+    targetPort:  
+    protocol: TCP
+    observability:  
+      metrics: true
+      accessLogs: true
+  websecure:
+    port: 8443
+    hostPort: 
+    containerPort:  
+    expose:
+      default: true
+    exposedPort: 443
+    protocol: TCP
+    observability: 
+      metrics:  true
+      accessLogs: true
+  metrics:
+    port: 9100
+    expose:
+      default: true
+    exposedPort: 9100
+    protocol: TCP
+service:
+  enabled: true
+  single: true
+  type: LoadBalancer
+rbac:  
+  enabled: true
+topologySpreadConstraints: 
+  - labelSelector:
+      matchLabels:
+        app.kubernetes.io/name: '{{ template "traefik.name" . }}'
+    maxSkew: 1
+    topologyKey: topology.kubernetes.io/zone
+    whenUnsatisfiable: ScheduleAnyway
+  - labelSelector:
+      matchLabels:
+        app.kubernetes.io/name: '{{ template "traefik.name" . }}'
+    maxSkew: 1
+    topologyKey: kubernetes.io/hostname
+    whenUnsatisfiable: ScheduleAnyway
+securityContext:
+  allowPrivilegeEscalation: false
+  capabilities:
+    drop: [ALL]
+  readOnlyRootFilesystem: true
+podSecurityContext:
+  runAsGroup: 65532
+  runAsNonRoot: true
+  runAsUser: 65532
+  seccompProfile:
+    type: RuntimeDefault
+enabled: true 
