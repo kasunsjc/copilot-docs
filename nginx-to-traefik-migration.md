@@ -28,11 +28,12 @@ In our environment, routes are primarily defined using Traefik's **file provider
 9. [Applying Configuration to the Cluster](#applying-configuration-to-the-cluster)
    - [Helm Values Example (Custom Cert + Ingress + File Provider)](#helm-values-example-custom-cert--ingress--file-provider)
    - [Optional Ingress Resource Example](#optional-ingress-resource-example)
-10. [Installation Script](#installation-script)
-11. [Verification](#verification)
-12. [Rollback Procedure](#rollback-procedure)
-13. [Troubleshooting](#troubleshooting)
-14. [References](#references)
+10. [Application Gateway Health Checks (`/ping`)](#application-gateway-health-checks-ping)
+11. [Installation Script](#installation-script)
+12. [Verification](#verification)
+13. [Rollback Procedure](#rollback-procedure)
+14. [Troubleshooting](#troubleshooting)
+15. [References](#references)
 
 ---
 
@@ -566,6 +567,34 @@ kubectl apply -f my-app-ingress.yaml
 ```
 
 > **Hot reload:** With `--providers.file.watch=true`, Traefik automatically picks up changes to the ConfigMap without a restart.
+
+---
+
+## Application Gateway Health Checks (`/ping`)
+
+When Azure Application Gateway is in front of Traefik, configure the backend health probe path as `/ping` instead of `/`.
+
+Traefik's dedicated health endpoint is `/ping`, so this path is the reliable option for gateway backend health checks.
+
+### Enable `/ping` in Traefik
+
+If not already enabled, add the following static arguments in your Traefik Helm values:
+
+```yaml
+additionalArguments:
+  - "--ping=true"
+  - "--ping.entryPoint=web"
+```
+
+### Application Gateway backend probe
+
+Set the probe path to:
+
+```text
+/ping
+```
+
+This ensures Application Gateway can consistently detect healthy Traefik backends.
 
 ---
 
