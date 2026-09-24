@@ -325,6 +325,117 @@ kubectl get pods -o wide --no-headers | awk '{print $8}' | sort | uniq -c
 - Node count and cost under anti-affinity rules are understood and acceptable.
 - Alerts exist for long-pending pods and repeated NAP provisioning failures.
 
+### Team runbook: NAP scheduling and placement tests
+
+Use this runbook in a non-production AKS cluster or an isolated production-like namespace. Record the Kubernetes version, NAP configuration, NodePool/AKSNodeClass revisions, VM quota, test start time, and results for each scenario.
+
+#### Preparation
+
+- [ ] Confirm NAP is enabled and all target `NodePool` and `AKSNodeClass` resources report ready.
+- [ ] Capture baseline node count, node labels, zones, instance types, NodeClaims, and available vCPU quota.
+- [ ] Confirm the test namespace has no unrelated workloads with the same labels used by affinity selectors.
+- [ ] Set realistic CPU and memory requests on every test Pod.
+- [ ] Record the expected placement rule, expected number of nodes, and acceptable provisioning latency for every test.
+- [ ] Create alerts or a dashboard for Pending Pods, failed NodeClaims, and NAP/Karpenter provisioning events.
+
+#### Execution steps for every test case
+
+1. Apply the test manifest and note the start time.
+2. Watch scheduling and NAP activity:
+
+   ```bash
+   kubectl get pods -n <namespace> -w
+   kubectl get nodeclaims -w
+   kubectl get events -A --field-selector source=karpenter -w
+   ```
+
+3. Confirm Pod events explain any pending state:
+
+   ```bash
+   kubectl describe pod -n <namespace> <pod-name>
+   ```
+
+4. Confirm the created node's zone, instance type, labels, taints, and NodePool ownership match the intended policy:
+
+   ```bash
+   kubectl get nodes -L topology.kubernetes.io/zone,node.kubernetes.io/instance-type
+   kubectl describe node <node-name>
+   ```
+
+5. Verify the actual Pod distribution by node and zone.
+6. Scale the workload up, then down, and repeat the placement check.
+7. Allow the configured consolidation window to pass; verify voluntary disruption preserves all required scheduling rules and PDBs.
+8. Delete the test workload and confirm NAP eventually cleans up unnecessary capacity according to its disruption policy.
+9. Capture relevant scheduler and Karpenter events, NodeClaim status, node count, elapsed provisioning time, and any unexpected VM selection.
+
+#### Checklist: affinity and anti-affinity
+
+- [ ] **Pod affinity:** Create the anchor workload first; confirm dependent Pods schedule in the expected topology domain.
+- [ ] **Required pod affinity:** Verify Pods remain pending with an understandable scheduler event when the anchor label/topology domain does not exist.
+- [ ] **Preferred pod affinity:** Verify workloads still schedule when the preference cannot be met, and record the fallback placement.
+- [ ] **Hostname anti-affinity:** Scale to at least the expected production replica count; verify one matching replica per node.
+- [ ] **Zone anti-affinity:** Confirm distinct replicas occupy the required number of zones and that the NodePool permits those zones.
+- [ ] **Required anti-affinity failure:** Restrict capacity, quota, or allowed zones deliberately; confirm Pods remain pending without repeated, wasteful provisioning.
+- [ ] **Preferred anti-affinity:** Confirm NAP can co-locate replicas only when necessary and that this behavior is acceptable.
+
+#### Checklist: topology and NodePool constraints
+
+- [ ] Test `topologySpreadConstraints` with `maxSkew: 1` across zones.
+- [ ] Test both `DoNotSchedule` and `ScheduleAnyway`; document the node-count and distribution difference.
+- [ ] Test node selectors and required node affinity against a permitted label, zone, architecture, or instance family.
+- [ ] Test an intentionally invalid selector or incompatible affinity rule; confirm the failure is clear and does not create excess nodes.
+- [ ] Test taints and tolerations for each isolated NodePool.
+- [ ] Test a Pod that could match more than one NodePool; confirm the selected pool follows your intended requirements and weight policy.
+- [ ] Test resource requests that require a larger VM shape, and verify the chosen SKU is permitted and cost-acceptable.
+
+#### Checklist: lifecycle and failure handling
+
+- [ ] Run a scale burst from baseline replicas to the expected peak; record provisioning and Ready-to-serve latency.
+- [ ] Test scale-down and consolidation with real affinity/anti-affinity and topology-spread rules in place.
+- [ ] Test a NodeClaim replacement caused by your configured node expiry or a safe drift change.
+- [ ] Verify PodDisruptionBudgets block unsafe consolidation and permit safe disruption.
+- [ ] Simulate or observe a zone/SKU capacity shortage; confirm expected fallback or actionable failure events.
+- [ ] Validate long-pending-pod and repeated-provisioning-failure alerts.
+
+#### Evidence to retain
+
+- [ ] Applied manifests and their Git revision.
+- [ ] Output from `kubectl get pods -o wide`, `kubectl get nodes`, and `kubectl get nodeclaims`.
+- [ ] Scheduler and Karpenter/NAP events for each test.
+- [ ] NodePool and AKSNodeClass manifests/status at the time of the test.
+- [ ] Timing, node-count, cost, and pass/fail results.
+
+### Go/no-go checklist for NAP rollout approval
+
+Mark **Go** only when every mandatory item is complete or an approved exception is documented.
+
+#### Go criteria
+
+- [ ] NAP prerequisites and compatibility checks are complete; no unsupported cluster dependencies remain.
+- [ ] Production `NodePool` and `AKSNodeClass` policies are reviewed, version-controlled, and have clear workload ownership.
+- [ ] NodePools are mutually exclusive where isolation is required; overlapping matches have an intentional and tested weight/selection policy.
+- [ ] Regional quotas, subnet/IP capacity, allowed VM families, and zone availability cover the expected peak plus the anti-affinity overhead.
+- [ ] Every production workload has realistic resource requests.
+- [ ] All required node affinity, pod affinity, pod anti-affinity, and topology-spread rules pass at expected production replica counts.
+- [ ] Tests prove behavior during scale-up, scale-down, consolidation, and node replacement—not only initial deployment.
+- [ ] PDBs, termination grace periods, and application shutdown behavior have been validated under voluntary node disruption.
+- [ ] Constrained-workload provisioning latency meets the agreed SLO.
+- [ ] No unexplainable Pending Pods, repeated failed NodeClaims, or unexpected VM selections occurred during the test window.
+- [ ] Monitoring and alerting exist for Pending Pods, NodeClaim failures, quota/capacity issues, and disruption failures.
+- [ ] Rollback ownership, decision thresholds, and a capacity-safe fallback plan are documented and rehearsed.
+
+#### No-go triggers
+
+Do **not** proceed with production rollout if any of the following are true:
+
+- [ ] A required workload becomes Pending under a valid, expected production constraint combination.
+- [ ] Hostname or zone anti-affinity requires more nodes, quota, or budget than approved.
+- [ ] Consolidation or node replacement breaks an affinity, anti-affinity, topology-spread, or PDB guarantee.
+- [ ] NAP selects disallowed SKU families, zones, or capacity types.
+- [ ] Node provisioning repeatedly fails due to quota, subnet/IP exhaustion, identity, image-pull, or capacity errors.
+- [ ] The team cannot explain scheduler and NAP events for a failed test.
+- [ ] The tested rollback path cannot restore safe capacity within the required recovery objective.
+
 ---
 
 ## Practical recommendation
