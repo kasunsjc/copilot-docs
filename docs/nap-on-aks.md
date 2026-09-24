@@ -182,6 +182,151 @@ kubectl get events -A --field-selector source=karpenter -w
 
 Review provisioning events and NodeClaim status to understand why nodes were created or not created.
 
+---
+
+## Testing pod placement with NAP (affinity, anti-affinity, and constraints)
+
+Reference: [Control where your pods land on AKS with NAP – AKS Engineering Blog](https://blog.aks.azure.com/2026/03/20/node-provisioning-best-practice)
+
+NAP reacts to **pending pods**. It reads the pod's scheduling expressions (node selectors, node affinity, pod affinity/anti-affinity, topology spread constraints, tolerations, and resource requests), combines them with `NodePool` and `AKSNodeClass` constraints, and then decides what node shape to create. Because of this, placement rules directly drive provisioning behavior — and over-constrained pods can either stay `Pending` forever or cause unnecessary node churn.
+
+### Core testing principles
+
+1. **Start simple, then add complexity.** Begin with the minimum constraint set, confirm it works, then layer on affinity or spread rules one at a time.
+2. **Change one constraint per test.** This isolates which rule caused a pod to stay pending or caused NAP to pick an unexpected SKU.
+3. **Do not over-constrain.** Broad anti-affinity or narrow selectors can make it impossible for NAP to find any valid node.
+4. **Always observe events, not just the end state.** Both the kube-scheduler and Karpenter emit events explaining why scheduling or provisioning failed.
+5. **Keep NodePools mutually exclusive.** If a pod matches multiple NodePools, placement becomes unpredictable. Use distinct taints, labels, and requirements per pool.
+
+### Test matrix
+
+| # | Test | What to verify | Expected result |
+|---|---|---|---|
+| 1 | Baseline scale-up | Deploy a workload with only resource requests | NAP provisions a correctly sized node; pod schedules |
+| 2 | Node affinity / nodeSelector | Require a specific label (e.g. zone, arch, SKU family) | NAP provisions a node carrying that label |
+| 3 | Pod affinity | Co-locate pods via `podAffinity` with a topology key | Pods land on the same node/zone as the target pod |
+| 4 | Pod anti-affinity (`kubernetes.io/hostname`) | Require replicas on separate nodes | NAP creates one node per replica; no co-location |
+| 5 | Pod anti-affinity (`topology.kubernetes.io/zone`) | Require replicas in separate zones | Nodes provisioned across distinct zones |
+| 6 | Preferred vs required | Compare `preferredDuringScheduling` and `requiredDuringScheduling` | Preferred degrades gracefully; required may leave pods pending |
+| 7 | Topology spread constraints | Spread N replicas across zones with `maxSkew` | Balanced distribution; no excessive node creation |
+| 8 | `whenUnsatisfiable` behavior | Test both `DoNotSchedule` and `ScheduleAnyway` | `DoNotSchedule` triggers provisioning; `ScheduleAnyway` may pack tighter |
+| 9 | Taints and tolerations | Workload targeting a tainted NodePool | Only tolerating pods land there |
+| 10 | Multiple NodePool match | Workload that could match 2 pools | Confirm intended pool wins via weight/requirements |
+| 11 | Over-constrained pod | Intentionally impossible constraint set | Pod stays `Pending`; clear event explains why; no runaway node creation |
+| 12 | Consolidation safety | Scale down and let NAP consolidate | Anti-affinity and spread rules still honored after consolidation |
+| 13 | Node replacement / drift | Trigger node expiry or drift replacement | Replacement nodes still satisfy affinity/spread rules |
+| 14 | PDB interaction | Consolidate with PDBs in place | PDBs respected; no availability drop |
+| 15 | Scale burst | Scale from 1 to N replicas rapidly | Constraints honored at scale; provisioning latency acceptable |
+| 16 | Zone capacity failure | Constrain to a capacity-limited zone | Clear failure events; verify fallback behavior |
+
+### Critical scenarios for anti-affinity users
+
+Because you rely on pod affinity/anti-affinity, pay particular attention to:
+
+- **Hostname anti-affinity forces one pod per node.** Every replica requires a dedicated node, so NAP will provision one node per replica. Confirm your NodePool limits and vCPU quota can absorb this, and check the cost impact — bin packing benefits are largely lost here.
+- **Anti-affinity plus consolidation.** Verify that when NAP consolidates, it does not attempt a replacement plan that would violate anti-affinity. Test with realistic replica counts, not just 2 replicas.
+- **Required anti-affinity can deadlock.** If NAP cannot create a node satisfying the rule (quota, SKU, or zone exhaustion), pods stay pending indefinitely. Make sure alerting covers long-pending pods.
+- **Prefer topology spread over anti-affinity where possible.** Spread constraints usually give better packing and more predictable NAP behavior than strict `requiredDuringSchedulingIgnoredDuringExecution` anti-affinity.
+- **Pod affinity is expensive to satisfy.** Co-location rules can force NAP into a narrow set of valid nodes. Validate that the anchor pod exists and is schedulable first.
+
+### Example test workload — zone spread
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nap-spread-test
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: nap-spread-test
+  template:
+    metadata:
+      labels:
+        app: nap-spread-test
+    spec:
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: DoNotSchedule
+          labelSelector:
+            matchLabels:
+              app: nap-spread-test
+      containers:
+        - name: app
+          image: mcr.microsoft.com/oss/nginx/nginx:1.25
+          resources:
+            requests:
+              cpu: 500m
+              memory: 512Mi
+```
+
+### Example test workload — hostname anti-affinity
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nap-antiaffinity-test
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: nap-antiaffinity-test
+  template:
+    metadata:
+      labels:
+        app: nap-antiaffinity-test
+    spec:
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels:
+                  app: nap-antiaffinity-test
+              topologyKey: kubernetes.io/hostname
+      containers:
+        - name: app
+          image: mcr.microsoft.com/oss/nginx/nginx:1.25
+          resources:
+            requests:
+              cpu: 500m
+              memory: 512Mi
+```
+
+### Validation commands
+
+```bash
+# Where did pods actually land?
+kubectl get pods -o wide -l app=nap-spread-test
+
+# Node-to-zone mapping
+kubectl get nodes -L topology.kubernetes.io/zone -L node.kubernetes.io/instance-type
+
+# Why is a pod pending?
+kubectl describe pod <pod-name>
+
+# What is NAP doing?
+kubectl get nodeclaims
+kubectl describe nodeclaim <nodeclaim-name>
+kubectl get events -A --field-selector source=karpenter -w
+
+# Count pods per node to confirm anti-affinity
+kubectl get pods -o wide --no-headers | awk '{print $8}' | sort | uniq -c
+```
+
+### Exit criteria before production rollout
+
+- All placement rules produce the intended distribution under both scale-up and scale-down.
+- No workload becomes permanently unschedulable under realistic constraint combinations.
+- Consolidation and node replacement preserve affinity, anti-affinity, and spread guarantees.
+- Provisioning latency for constrained workloads is within your SLOs.
+- Node count and cost under anti-affinity rules are understood and acceptable.
+- Alerts exist for long-pending pods and repeated NAP provisioning failures.
+
+---
+
 ## Practical recommendation
 
 For most AKS teams, the safest migration path is:
@@ -199,7 +344,8 @@ NAP is useful when you want AKS to make node selection and lifecycle decisions b
 
 ## References
 
+- [Control where your pods land on AKS with NAP – AKS Engineering Blog](https://blog.aks.azure.com/2026/03/20/node-provisioning-best-practice)
+- [Configure node pools for node auto-provisioning (NAP) in AKS](https://learn.microsoft.com/en-us/azure/aks/node-auto-provisioning-node-pools)
 - Azure AKS Node Auto-Provisioning documentation
 - Azure AKS migration guidance from Cluster Autoscaler to NAP
-- AKS Karpenter and NodePool documentation
 - AKS troubleshooting guidance for NAP and node provisioning
