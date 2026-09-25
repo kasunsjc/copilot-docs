@@ -82,6 +82,42 @@ For the platform testing cluster, start simple:
 apiVersion: karpenter.sh/v1
 kind: NodePool
 metadata:
+  name: system-surge
+spec:
+  template:
+    metadata:
+      labels:
+        kubernetes.azure.com/mode: system
+    spec:
+      nodeClassRef:
+        group: karpenter.azure.com
+        kind: AKSNodeClass
+        name: general
+      taints:
+        - key: CriticalAddonsOnly
+          value: "true"
+          effect: NoSchedule
+      requirements:
+        - key: karpenter.azure.com/sku-family
+          operator: In
+          values: [D]
+        - key: kubernetes.io/arch
+          operator: In
+          values: [amd64]
+        - key: karpenter.sh/capacity-type
+          operator: In
+          values: [on-demand]   # avoid spot for system pods
+  limits:
+    cpu: "32"                  # cap how far system pods can burst
+  disruption:
+    consolidationPolicy: WhenEmpty
+    consolidateAfter: 5m
+```
+
+```yaml
+apiVersion: karpenter.sh/v1
+kind: NodePool
+metadata:
   name: platform-dev-general
 spec:
   template:
