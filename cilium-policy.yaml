@@ -1,0 +1,30 @@
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata:
+  name: dns-visibility
+  namespace: <your-ns>
+spec:
+  endpointSelector: {}
+  egress:
+  # DNS through the proxy (for the metrics)
+  - toEndpoints:
+    - matchLabels:
+        k8s:io.kubernetes.pod.namespace: kube-system
+        k8s:k8s-app: kube-dns
+    toPorts:
+    - ports:
+      - port: "53"
+        protocol: ANY
+      rules:
+        dns:
+        - matchPattern: "*"
+  # In-cluster traffic
+  - toEntities: ["cluster"]
+  # API server
+  - toEntities: ["kube-apiserver"]
+  # Internet only on HTTPS
+  - toEntities: ["world"]
+    toPorts:
+    - ports:
+      - port: "443"
+        protocol: TCP
