@@ -28,3 +28,30 @@ spec:
     - ports:
       - port: "443"
         protocol: TCP
+
+---
+
+apiVersion: cilium.io/v2
+kind: CiliumClusterwideNetworkPolicy
+metadata:
+  name: dns-visibility
+spec:
+  enableDefaultDeny:
+    egress: false        # don't block traffic this policy doesn't mention
+    ingress: false
+  endpointSelector:
+    matchLabels:
+      # opt-in: only namespaces labelled dns-visibility=enabled
+      k8s:io.cilium.k8s.namespace.labels.dns-visibility: enabled
+  egress:
+  - toEndpoints:
+    - matchLabels:
+        k8s:io.kubernetes.pod.namespace: kube-system
+        k8s:k8s-app: kube-dns
+    toPorts:
+    - ports:
+      - port: "53"
+        protocol: ANY
+      rules:
+        dns:
+        - matchPattern: "*"
